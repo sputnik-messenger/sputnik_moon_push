@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
 
-func makeHandleNotify(state SharedState) func(w http.ResponseWriter, r *http.Request) {
+func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Body == nil {
@@ -28,25 +29,23 @@ func makeHandleNotify(state SharedState) func(w http.ResponseWriter, r *http.Req
 		log.Println(string(strBytes))
 
 		for _, device := range notifyRequest.Notification.Devices {
-			state.mux.Lock()
-			clientState, ok := state.clients[device.Pushkey]
-			seen := false
-			if ok {
-				clientState.lastNotify = notifyRequest
-				eventId := notifyRequest.Notification.EventID
+			token := device.Pushkey
+			isClientKnown := state.IsClientKnown(&token)
+			eventId := notifyRequest.Notification.EventID
+			isEventIdKnown := false
+			if isClientKnown {
+				println("set last notify")
+				state.SetLastNotify(&token, &notifyRequest)
 				if len(eventId) > 0 {
-					_, seen = clientState.seenEventIds[eventId]
-					if !seen {
-						clientState.seenEventIds[eventId] = struct{}{}
-					}
+					isEventIdKnown = state.IsEventIdKnown(&token, &eventId)
 				}
 			}
-			state.mux.Unlock()
-			if ok && !seen {
-				log.Println("send to channel")
-				clientState.channel <- notifyRequest
-			} else if ok && seen {
+			if isClientKnown && isEventIdKnown {
 				log.Println("event is a duplicate, not sending to client")
+			} else if isClientKnown {
+				log.Println("send to channel")
+				state.SendNotifyToClientChannel(&token, &notifyRequest)
+				state.AddKnownEventId(&token, &eventId)
 			} else {
 				log.Println("client not connected")
 			}
@@ -61,57 +60,42 @@ func makeHandleNotify(state SharedState) func(w http.ResponseWriter, r *http.Req
 	}
 }
 
-func makeSendNotifications(state SharedState) func(w http.ResponseWriter, r *http.Request) {
+func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		tokens, ok := r.URL.Query()["token"]
-		if !ok || len(tokens) == 0 || len(tokens[0]) == 0 {
+		tokens, hasTokenParam := r.URL.Query()["token"]
+		if !hasTokenParam || len(tokens) == 0 || len(tokens[0]) == 0 {
 			http.Error(w, "missing token", 400)
 			return
 		}
 
-		w.Header().Set("Cache-Control", "no-cache");
-		w.Header().Set("Content-Type", "text/event-stream");
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Transfer-Encoding", "identity")
 		w.Header().Set("Connection", "keep-alive")
 
 		token := tokens[0]
 		log.Println("client with token " + token)
-
-		state.mux.Lock()
-		clientState, ok := state.clients[token]
-		if ok {
-			log.Println("client found!! channel will be replaced!")
-			clientState.channel = make(chan NotifyRequest, 1000)
-		} else {
-			log.Println("new client")
-			clientState = ClientState{
-				channel:      make(chan NotifyRequest, 1000),
-				lastNotify:   NotifyRequest{},
-				seenEventIds: make(map[string]struct{}),
-			}
-			state.clients[token] = clientState
-		}
-		state.mux.Unlock()
+		state.NewClient(&token)
 
 		for {
 			select {
 			case <-r.Context().Done():
 				log.Println("sse connection closed")
 				return
-			case notifyRequest := <-clientState.channel:
+			case notifyRequest := <-state.GetClientChannel(&token):
 				log.Println("send data")
 
 				strBytes, _ := json.Marshal(notifyRequest)
-				jsonString := strings.ReplaceAll(string(strBytes), "\n", "")
-				_, err := fmt.Fprintf(w, "data: "+jsonString, "\n")
+				jsonString := RemoveLineBreaks(string(strBytes))
+				_, err := fmt.Fprintf(w, "data: "+jsonString+"\n")
 				if err != nil {
 					log.Println(err.Error())
 				} else {
 					if f, ok := w.(http.Flusher); ok {
 						f.Flush()
 					} else {
-						log.Fatal("Can't do SSE without Flushing.");
+						log.Fatal("Can't do SSE without Flushing.")
 					}
 				}
 				if err != nil {
@@ -124,15 +108,75 @@ func makeSendNotifications(state SharedState) func(w http.ResponseWriter, r *htt
 	}
 }
 
+func makeHandlePollLastNotify(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		tokens, ok := r.URL.Query()["token"]
+		if !ok || len(tokens) == 0 || len(tokens[0]) == 0 {
+			http.Error(w, "missing token", 400)
+			return
+		}
+		token := tokens[0]
+
+		sinces, ok := r.URL.Query()["since"]
+		if !ok || len(sinces) == 0 || len(sinces[0]) == 0 {
+			http.Error(w, "missing since", 400)
+			return
+		}
+
+		since, err := strconv.Atoi(sinces[0])
+		if err != nil {
+			http.Error(w, "since must be int", 400)
+			return
+		}
+
+		log.Printf("Poll since %d with token %s\n", since, token)
+
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Content-Type", "application/json")
+		isClientKnown := state.IsClientKnown(&token)
+
+		if !isClientKnown {
+			http.Error(w, "invalid token", 400)
+			return
+		}
+
+		lastNotify := state.GetLastNotify(&token)
+		if lastNotify == nil {
+			log.Println("No lastNotify")
+			return
+		}
+
+		pushkeyTs := 0
+		for _, d := range lastNotify.Notification.Devices {
+			log.Println(d.Pushkey)
+			if d.Pushkey == token {
+				pushkeyTs = d.PushkeyTs
+			}
+		}
+		if pushkeyTs >= since {
+			strBytes, _ := json.Marshal(lastNotify)
+			jsonString := RemoveLineBreaks(string(strBytes))
+			_, err := fmt.Fprintf(w, jsonString+"\n")
+			if err != nil {
+				log.Println(err.Error())
+			}
+			return
+		}
+	}
+}
+
 func main() {
 	log.Println("starting server")
 
 	sharedState := SharedState{
-		clients: make(map[string]ClientState),
+		clients: make(map[string]*ClientState),
 	}
 
-	http.HandleFunc("/push_gateway/_matrix/push/v1/notify", makeHandleNotify(sharedState))
-	http.HandleFunc("/push_gateway/notifications", makeSendNotifications(sharedState))
+	http.HandleFunc("/push_gateway/_matrix/push/v1/notify", makeHandleNotify(&sharedState))
+	http.HandleFunc("/push_gateway/notifications", makeSendNotifications(&sharedState))
+	http.HandleFunc("/push_gateway/notifications/poll", makeHandlePollLastNotify(&sharedState))
 
 	log.Fatal(http.ListenAndServe(":6002", nil))
 }
@@ -173,12 +217,80 @@ type NotifyResponse struct {
 }
 
 type SharedState struct {
-	mux     sync.Mutex
-	clients map[string]ClientState
+	mux     sync.RWMutex
+	clients map[string]*ClientState
 }
 
 type ClientState struct {
-	channel      chan NotifyRequest
-	lastNotify   NotifyRequest
-	seenEventIds map[string]struct{}
+	channel       chan *NotifyRequest
+	lastNotify    *NotifyRequest
+	hasLastNotify bool
+	seenEventIds  map[string]bool
+}
+
+func (state *SharedState) IsClientKnown(token *string) bool {
+	state.mux.RLock()
+	known := state.clients[*token] != nil
+	state.mux.RUnlock()
+	return known
+}
+
+func (state *SharedState) SetLastNotify(token *string, notify *NotifyRequest) {
+	state.mux.Lock()
+	state.clients[*token].lastNotify = notify
+	state.clients[*token].hasLastNotify = true
+	state.mux.Unlock()
+}
+
+func (state *SharedState) GetLastNotify(token *string) *NotifyRequest {
+	state.mux.RLock()
+	lastNotify := state.clients[*token].lastNotify
+	state.mux.RUnlock()
+	return lastNotify
+}
+
+func (state *SharedState) IsEventIdKnown(token *string, eventId *string) bool {
+	state.mux.RLock()
+	isEventIdKnown := state.clients[*token].seenEventIds[*eventId]
+	state.mux.RUnlock()
+	return isEventIdKnown
+}
+
+func (state *SharedState) AddKnownEventId(token *string, eventId *string) {
+	if len(*eventId) > 0 {
+		state.mux.Lock()
+		state.clients[*token].seenEventIds[*eventId] = true
+		state.mux.Unlock()
+	}
+}
+
+func (state *SharedState) SendNotifyToClientChannel(token *string, notify *NotifyRequest) {
+	state.clients[*token].channel <- notify
+}
+func (state *SharedState) NewClient(token *string) {
+	state.mux.Lock()
+	known := state.clients[*token] != nil
+	if known {
+		log.Println("client found!! channel will be replaced!")
+		state.clients[*token].channel = make(chan *NotifyRequest, 1000)
+	} else {
+		log.Println("new client")
+		state.clients[*token] = &ClientState{
+			channel:      make(chan *NotifyRequest, 1000),
+			lastNotify:   nil,
+			seenEventIds: make(map[string]bool),
+		}
+	}
+	state.mux.Unlock()
+}
+
+func (state *SharedState) GetClientChannel(token *string) chan *NotifyRequest {
+	state.mux.RLock()
+	channel := state.clients[*token].channel
+	state.mux.RUnlock()
+	return channel
+}
+
+func RemoveLineBreaks(text string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", "")
 }
