@@ -29,15 +29,26 @@ func makeHandleNotify(state SharedState) func(w http.ResponseWriter, r *http.Req
 
 		for _, device := range notifyRequest.Notification.Devices {
 			state.mux.Lock()
-			channel := state.clients[device.Pushkey]
-			if channel == nil {
-				log.Println("no client connected")
+			clientState, ok := state.clients[device.Pushkey]
+			seen := false
+			if ok {
+				clientState.lastNotify = notifyRequest
+				eventId := notifyRequest.Notification.EventID
+				if len(eventId) > 0 {
+					_, seen = clientState.seenEventIds[eventId]
+					if !seen {
+						clientState.seenEventIds[eventId] = struct{}{}
+					}
+				}
 			}
 			state.mux.Unlock()
-
-			if channel != nil {
+			if ok && !seen {
 				log.Println("send to channel")
-				channel <- notifyRequest
+				clientState.channel <- notifyRequest
+			} else if ok && seen {
+				log.Println("event is a duplicate, not sending to client")
+			} else {
+				log.Println("client not connected")
 			}
 		}
 
@@ -68,27 +79,32 @@ func makeSendNotifications(state SharedState) func(w http.ResponseWriter, r *htt
 		log.Println("client with token " + token)
 
 		state.mux.Lock()
-		channel := state.clients[token]
-		if channel != nil {
-			log.Println("old channel found!! will be replaced!")
+		clientState, ok := state.clients[token]
+		if ok {
+			log.Println("client found!! channel will be replaced!")
+			clientState.channel = make(chan NotifyRequest, 1000)
+		} else {
+			log.Println("new client")
+			clientState = ClientState{
+				channel:      make(chan NotifyRequest, 1000),
+				lastNotify:   NotifyRequest{},
+				seenEventIds: make(map[string]struct{}),
+			}
+			state.clients[token] = clientState
 		}
-		log.Println("new channel")
-		channel = make(chan NotifyRequest, 1000)
-		state.clients[token] = channel
 		state.mux.Unlock()
 
 		for {
 			select {
 			case <-r.Context().Done():
-				log.Println("sse conncetion closed")
+				log.Println("sse connection closed")
 				return
-			case notifyRequest := <-channel:
-				r.Context().Done()
+			case notifyRequest := <-clientState.channel:
 				log.Println("send data")
 
 				strBytes, _ := json.Marshal(notifyRequest)
 				jsonString := strings.ReplaceAll(string(strBytes), "\n", "")
-				_, err := fmt.Fprintf(w, "data: "+jsonString,"\n")
+				_, err := fmt.Fprintf(w, "data: "+jsonString, "\n")
 				if err != nil {
 					log.Println(err.Error())
 				} else {
@@ -112,7 +128,7 @@ func main() {
 	log.Println("starting server")
 
 	sharedState := SharedState{
-		clients: make(map[string]chan NotifyRequest),
+		clients: make(map[string]ClientState),
 	}
 
 	http.HandleFunc("/push_gateway/_matrix/push/v1/notify", makeHandleNotify(sharedState))
@@ -158,10 +174,11 @@ type NotifyResponse struct {
 
 type SharedState struct {
 	mux     sync.Mutex
-	clients map[string]chan NotifyRequest
+	clients map[string]ClientState
 }
 
 type ClientState struct {
-	channel          chan int
-	lastNotification NotifyRequest
+	channel      chan NotifyRequest
+	lastNotify   NotifyRequest
+	seenEventIds map[string]struct{}
 }
