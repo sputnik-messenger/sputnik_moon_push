@@ -155,7 +155,7 @@ func makeHandlePollLastNotify(state *SharedState) func(w http.ResponseWriter, r 
 				pushkeyTs = d.PushkeyTs
 			}
 		}
-		if pushkeyTs >= since {
+		if pushkeyTs > since {
 			strBytes, _ := json.Marshal(lastNotify)
 			jsonString := RemoveLineBreaks(string(strBytes))
 			_, err := fmt.Fprintf(w, jsonString+"\n")
