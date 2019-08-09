@@ -69,14 +69,29 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 			return
 		}
 
+		since := 0
+		sinces, hasSinceParam := r.URL.Query()["since"]
+		if hasSinceParam && len(sinces) > 0 && len(sinces[0]) > 0 {
+			parsed, err := strconv.Atoi(sinces[0])
+			if err == nil {
+				since = parsed
+			}
+		}
+
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Transfer-Encoding", "identity")
 		w.Header().Set("Connection", "keep-alive")
 
 		token := tokens[0]
-		log.Println("client with token " + token)
+		log.Printf("Client since %d with token %s\n", since, token)
+
 		state.NewClient(&token)
+
+		lastNotify := state.GetLastNotify(&token)
+		if lastNotify != nil && since < lastNotify.GetPushkeyTs(&token) {
+			state.GetClientChannel(&token) <- lastNotify
+		}
 
 		for {
 			select {
@@ -148,13 +163,8 @@ func makeHandlePollLastNotify(state *SharedState) func(w http.ResponseWriter, r 
 			return
 		}
 
-		pushkeyTs := 0
-		for _, d := range lastNotify.Notification.Devices {
-			log.Println(d.Pushkey)
-			if d.Pushkey == token {
-				pushkeyTs = d.PushkeyTs
-			}
-		}
+		pushkeyTs := lastNotify.GetPushkeyTs(&token)
+
 		if pushkeyTs > since {
 			strBytes, _ := json.Marshal(lastNotify)
 			jsonString := RemoveLineBreaks(string(strBytes))
@@ -293,4 +303,14 @@ func (state *SharedState) GetClientChannel(token *string) chan *NotifyRequest {
 
 func RemoveLineBreaks(text string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", "")
+}
+
+func (notify *NotifyRequest) GetPushkeyTs(pushkey *string) int {
+	pushkeyTs := 0
+	for _, d := range notify.Notification.Devices {
+		if d.Pushkey == *pushkey {
+			pushkeyTs = d.PushkeyTs
+		}
+	}
+	return pushkeyTs
 }
