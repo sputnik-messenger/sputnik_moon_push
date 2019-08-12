@@ -3,14 +3,21 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/gorilla/websocket"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
-	"github.com/gorilla/websocket"
 	"time"
 )
+
+func hash(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
 
 func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
 
@@ -28,31 +35,36 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		strBytes, _ := json.Marshal(notifyRequest)
-		log.Println(string(strBytes))
+		//strBytes, _ := json.Marshal(notifyRequest)
 
-		var pushMessage = notifyRequest.ToPushMessage(int(time.Now().Unix()))
+		pushMessage := notifyRequest.ToPushMessage(int(time.Now().Unix()))
+		eventId := notifyRequest.Notification.EventID
+		roomId := notifyRequest.Notification.RoomID
+		unread := notifyRequest.Notification.Counts.Unread
 
 		for _, device := range notifyRequest.Notification.Devices {
 			token := device.Pushkey
 			isClientKnown := state.IsClientKnown(&token)
-			eventId := notifyRequest.Notification.EventID
+
+			targetPushKeyHash := hash(notifyRequest.Notification.Devices[0].Pushkey)
+			log.Printf("#%d → %d\t%s %s\n", unread, targetPushKeyHash, eventId, roomId)
+
 			isEventIdKnown := false
 			if isClientKnown {
-				println("set last notify")
+				log.Printf("set last notify for %d\n", targetPushKeyHash)
 				state.SetLastNotify(&token, pushMessage)
 				if len(eventId) > 0 {
 					isEventIdKnown = state.IsEventIdKnown(&token, &eventId)
 				}
 			}
 			if isClientKnown && isEventIdKnown {
-				log.Println("event is a duplicate, not sending to client")
+				log.Printf("%d is a duplicate, not sending to client\n", eventId)
 			} else if isClientKnown {
-				log.Println("send to channel")
+				log.Printf("send to channel of %d\n", targetPushKeyHash)
 				state.SendNotifyToClientChannel(&token, pushMessage)
 				state.AddKnownEventId(&token, &eventId)
 			} else {
-				log.Println("client not connected")
+				log.Printf("%d not connected\n", targetPushKeyHash)
 			}
 		}
 
@@ -97,7 +109,8 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 		}
 
 		token := tokens[0]
-		log.Printf("Client since %d with token %s\n", since, token)
+		tokenHash := hash(token)
+		log.Printf("connect since %d for %d\n", since, tokenHash)
 
 		state.NewClient(&token)
 
@@ -106,7 +119,7 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 		clientChannel, hasChannel := state.GetClientChannel(&token)
 
 		if !hasChannel {
-			log.Println("no connected channel for client")
+			log.Printf("no connected channel for %d\n", tokenHash)
 			return
 		}
 
@@ -348,7 +361,7 @@ func (state *SharedState) SendNotifyToClientChannel(token *string, notify *PushM
 
 	l := len(channel)
 	if l > 0 {
-		log.Printf(" %d messages in channel", l)
+		log.Printf("%d messages in channel\n", l)
 	}
 
 	select {
@@ -361,10 +374,10 @@ func (state *SharedState) NewClient(token *string) {
 	state.mux.Lock()
 	known := state.clients[*token] != nil
 	if known {
-		log.Println("client found!! channel will be replaced!")
+		log.Println("old channel exits! ... will be replaced!")
 		state.clients[*token].channel = make(chan *PushMessage, 1000)
 	} else {
-		log.Println("new client")
+		log.Printf("new client #%d\n", len(state.clients))
 		state.clients[*token] = &ClientState{
 			channel:      make(chan *PushMessage, 1000),
 			lastNotify:   nil,
