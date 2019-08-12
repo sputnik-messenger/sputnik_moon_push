@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"github.com/gorilla/websocket"
+	"time"
 )
 
 func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +31,8 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 		strBytes, _ := json.Marshal(notifyRequest)
 		log.Println(string(strBytes))
 
+		var pushMessage = notifyRequest.ToPushMessage(int(time.Now().Unix()))
+
 		for _, device := range notifyRequest.Notification.Devices {
 			token := device.Pushkey
 			isClientKnown := state.IsClientKnown(&token)
@@ -37,7 +40,7 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 			isEventIdKnown := false
 			if isClientKnown {
 				println("set last notify")
-				state.SetLastNotify(&token, &notifyRequest)
+				state.SetLastNotify(&token, pushMessage)
 				if len(eventId) > 0 {
 					isEventIdKnown = state.IsEventIdKnown(&token, &eventId)
 				}
@@ -46,7 +49,7 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 				log.Println("event is a duplicate, not sending to client")
 			} else if isClientKnown {
 				log.Println("send to channel")
-				state.SendNotifyToClientChannel(&token, &notifyRequest)
+				state.SendNotifyToClientChannel(&token, pushMessage)
 				state.AddKnownEventId(&token, &eventId)
 			} else {
 				log.Println("client not connected")
@@ -107,8 +110,13 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 			return
 		}
 
-		if lastNotify != nil && since < lastNotify.GetPushkeyTs(&token) {
-			clientChannel <- lastNotify
+		if lastNotify != nil && since < lastNotify.Timestamp {
+			log.Println("say hi with last notify")
+			state.SendNotifyToClientChannel(&token, lastNotify)
+		} else if lastNotify == nil {
+			log.Println("no last notify")
+		} else {
+			log.Println("client has not missed events")
 		}
 
 		wsCloseChannel := make(chan bool, 1)
@@ -211,9 +219,7 @@ func makeHandlePollLastNotify(state *SharedState) func(w http.ResponseWriter, r 
 			return
 		}
 
-		pushkeyTs := lastNotify.GetPushkeyTs(&token)
-
-		if pushkeyTs > since {
+		if lastNotify.Timestamp > since {
 			strBytes, _ := json.Marshal(lastNotify)
 			jsonString := RemoveLineBreaks(string(strBytes))
 			_, err := fmt.Fprintf(w, jsonString+"\n")
@@ -274,14 +280,24 @@ type NotifyResponse struct {
 	Rejected []string `json:"rejected"`
 }
 
+type PushMessage struct {
+	Notification struct {
+		EventID string `json:"event_id"`
+		Counts  struct {
+			Unread int `json:"unread"`
+		} `json:"counts"`
+	} `json:"notification"`
+	Timestamp int `json:"timestamp"`
+}
+
 type SharedState struct {
 	mux     sync.RWMutex
 	clients map[string]*ClientState
 }
 
 type ClientState struct {
-	channel       chan *NotifyRequest
-	lastNotify    *NotifyRequest
+	channel       chan *PushMessage
+	lastNotify    *PushMessage
 	hasLastNotify bool
 	seenEventIds  map[string]bool
 }
@@ -293,14 +309,14 @@ func (state *SharedState) IsClientKnown(token *string) bool {
 	return known
 }
 
-func (state *SharedState) SetLastNotify(token *string, notify *NotifyRequest) {
+func (state *SharedState) SetLastNotify(token *string, notify *PushMessage) {
 	state.mux.Lock()
 	state.clients[*token].lastNotify = notify
 	state.clients[*token].hasLastNotify = true
 	state.mux.Unlock()
 }
 
-func (state *SharedState) GetLastNotify(token *string) *NotifyRequest {
+func (state *SharedState) GetLastNotify(token *string) *PushMessage {
 	state.mux.RLock()
 	lastNotify := state.clients[*token].lastNotify
 	state.mux.RUnlock()
@@ -322,11 +338,23 @@ func (state *SharedState) AddKnownEventId(token *string, eventId *string) {
 	}
 }
 
-func (state *SharedState) SendNotifyToClientChannel(token *string, notify *NotifyRequest) {
+func (state *SharedState) SendNotifyToClientChannel(token *string, notify *PushMessage) {
+	channel := state.clients[*token].channel
+
+	if channel == nil {
+		log.Println("no active channel to known client")
+		return
+	}
+
+	l := len(channel)
+	if l > 0 {
+		log.Printf(" %d messages in channel", l)
+	}
+
 	select {
-	case state.clients[*token].channel <- notify:
+	case channel <- notify:
 	default:
-		log.Println("channel full!")
+		log.Println("sending to channel would block, skipping!")
 	}
 }
 func (state *SharedState) NewClient(token *string) {
@@ -334,11 +362,11 @@ func (state *SharedState) NewClient(token *string) {
 	known := state.clients[*token] != nil
 	if known {
 		log.Println("client found!! channel will be replaced!")
-		state.clients[*token].channel = make(chan *NotifyRequest, 1000)
+		state.clients[*token].channel = make(chan *PushMessage, 1000)
 	} else {
 		log.Println("new client")
 		state.clients[*token] = &ClientState{
-			channel:      make(chan *NotifyRequest, 1000),
+			channel:      make(chan *PushMessage, 1000),
 			lastNotify:   nil,
 			seenEventIds: make(map[string]bool),
 		}
@@ -346,7 +374,7 @@ func (state *SharedState) NewClient(token *string) {
 	state.mux.Unlock()
 }
 
-func (state *SharedState) GetClientChannel(token *string) (chan *NotifyRequest, bool) {
+func (state *SharedState) GetClientChannel(token *string) (chan *PushMessage, bool) {
 	state.mux.RLock()
 	channel := state.clients[*token].channel
 	state.mux.RUnlock()
@@ -363,12 +391,10 @@ func RemoveLineBreaks(text string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", "")
 }
 
-func (notify *NotifyRequest) GetPushkeyTs(pushkey *string) int {
-	pushkeyTs := 0
-	for _, d := range notify.Notification.Devices {
-		if d.Pushkey == *pushkey {
-			pushkeyTs = d.PushkeyTs
-		}
-	}
-	return pushkeyTs
+func (notify *NotifyRequest) ToPushMessage(timestamp int) *PushMessage {
+	msg := new(PushMessage)
+	msg.Timestamp = timestamp
+	msg.Notification.EventID = notify.Notification.EventID
+	msg.Notification.Counts.Unread = notify.Notification.Counts.Unread
+	return msg
 }
