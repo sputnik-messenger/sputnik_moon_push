@@ -8,11 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"github.com/gorilla/websocket"
 )
 
 func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
 
 	return func(w http.ResponseWriter, r *http.Request) {
+
 		if r.Body == nil {
 			http.Error(w, "Please send a request body", 400)
 			return
@@ -61,6 +63,11 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 }
 
 func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *http.Request) {
+	var upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		tokens, hasTokenParam := r.URL.Query()["token"]
@@ -79,9 +86,12 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 		}
 
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Transfer-Encoding", "identity")
-		w.Header().Set("Connection", "keep-alive")
+
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println(err)
+			return
+		}
 
 		token := tokens[0]
 		log.Printf("Client since %d with token %s\n", since, token)
@@ -89,32 +99,70 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 		state.NewClient(&token)
 
 		lastNotify := state.GetLastNotify(&token)
-		if lastNotify != nil && since < lastNotify.GetPushkeyTs(&token) {
-			state.GetClientChannel(&token) <- lastNotify
+
+		clientChannel, hasChannel := state.GetClientChannel(&token)
+
+		if !hasChannel {
+			log.Println("no connected channel for client")
+			return
 		}
+
+		if lastNotify != nil && since < lastNotify.GetPushkeyTs(&token) {
+			clientChannel <- lastNotify
+		}
+
+		wsCloseChannel := make(chan bool, 1)
+		wsPingChannel := make(chan string, 100)
+		wsReadErrorChannel := make(chan bool, 1)
+
+		defaultPingHandler := ws.PingHandler()
+		ws.SetPingHandler(func(data string) error {
+			wsPingChannel <- data
+			return defaultPingHandler(data)
+		})
+
+		defaultCloseHandler := ws.CloseHandler()
+		ws.SetCloseHandler(func(code int, text string) error {
+			wsPingChannel <- text
+			return defaultCloseHandler(code, text)
+		})
+
+		go func() {
+			for {
+				_, _, err := ws.ReadMessage()
+				if err != nil {
+					log.Println(err.Error())
+					wsReadErrorChannel <- true
+					return
+				}
+			}
+		}()
 
 		for {
 			select {
 			case <-r.Context().Done():
-				log.Println("sse connection closed")
+				log.Println("request connection closed")
+				state.RemoveClientChannel(&token)
 				return
-			case notifyRequest := <-state.GetClientChannel(&token):
-				log.Println("send data")
+			case <-wsCloseChannel:
+				log.Println("ws connection closed")
+				state.RemoveClientChannel(&token)
+				return
+			case <-wsReadErrorChannel:
+				log.Println("ws read error")
+				state.RemoveClientChannel(&token)
+				return
+			case <-wsPingChannel:
+				log.Println("received ping")
+			case notifyRequest := <-clientChannel:
 
+				log.Println("send data")
 				strBytes, _ := json.Marshal(notifyRequest)
-				jsonString := RemoveLineBreaks(string(strBytes))
-				_, err := fmt.Fprintf(w, "data: "+jsonString+"\n")
+
+				err := ws.WriteMessage(websocket.TextMessage, strBytes)
+
 				if err != nil {
 					log.Println(err.Error())
-				} else {
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					} else {
-						log.Fatal("Can't do SSE without Flushing.")
-					}
-				}
-				if err != nil {
-					http.Error(w, err.Error(), 500)
 					return
 				}
 			}
@@ -185,7 +233,7 @@ func main() {
 	}
 
 	http.HandleFunc("/push_gateway/_matrix/push/v1/notify", makeHandleNotify(&sharedState))
-	http.HandleFunc("/push_gateway/notifications", makeSendNotifications(&sharedState))
+	http.HandleFunc("/push_gateway/notifications/push", makeSendNotifications(&sharedState))
 	http.HandleFunc("/push_gateway/notifications/poll", makeHandlePollLastNotify(&sharedState))
 
 	log.Fatal(http.ListenAndServe(":6002", nil))
@@ -275,7 +323,11 @@ func (state *SharedState) AddKnownEventId(token *string, eventId *string) {
 }
 
 func (state *SharedState) SendNotifyToClientChannel(token *string, notify *NotifyRequest) {
-	state.clients[*token].channel <- notify
+	select {
+	case state.clients[*token].channel <- notify:
+	default:
+		log.Println("channel full!")
+	}
 }
 func (state *SharedState) NewClient(token *string) {
 	state.mux.Lock()
@@ -294,11 +346,17 @@ func (state *SharedState) NewClient(token *string) {
 	state.mux.Unlock()
 }
 
-func (state *SharedState) GetClientChannel(token *string) chan *NotifyRequest {
+func (state *SharedState) GetClientChannel(token *string) (chan *NotifyRequest, bool) {
 	state.mux.RLock()
 	channel := state.clients[*token].channel
 	state.mux.RUnlock()
-	return channel
+	return channel, channel != nil
+}
+
+func (state *SharedState) RemoveClientChannel(token *string) {
+	state.mux.Lock()
+	state.clients[*token].channel = nil
+	state.mux.Unlock()
 }
 
 func RemoveLineBreaks(text string) string {
