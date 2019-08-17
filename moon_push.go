@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-func hash(s string) uint32 {
+func hash(s *string) uint32 {
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(s))
+	_, _ = h.Write([]byte(*s))
 	return h.Sum32()
 }
 
@@ -39,15 +39,14 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 
 		pushMessage := notifyRequest.ToPushMessage(int(time.Now().Unix()))
 		eventId := notifyRequest.Notification.EventID
-		roomId := notifyRequest.Notification.RoomID
 		unread := notifyRequest.Notification.Counts.Unread
 
 		for _, device := range notifyRequest.Notification.Devices {
 			token := device.Pushkey
 			isClientKnown := state.IsClientKnown(&token)
 
-			targetPushKeyHash := hash(notifyRequest.Notification.Devices[0].Pushkey)
-			log.Printf("#%d → %d\t%s %s\n", unread, targetPushKeyHash, eventId, roomId)
+			targetPushKeyHash := hash(&notifyRequest.Notification.Devices[0].Pushkey)
+			log.Printf("notify %d, unread: %d, triggered by event: %t\n", targetPushKeyHash, unread, len(eventId) > 0)
 
 			isEventIdKnown := false
 			if isClientKnown {
@@ -58,13 +57,13 @@ func makeHandleNotify(state *SharedState) func(w http.ResponseWriter, r *http.Re
 				}
 			}
 			if isClientKnown && isEventIdKnown {
-				log.Printf("%d is a duplicate, not sending to client\n", eventId)
+				log.Printf("%s is a duplicate, not sending to %d\n", eventId, targetPushKeyHash)
 			} else if isClientKnown {
 				log.Printf("send to channel of %d\n", targetPushKeyHash)
 				state.SendNotifyToClientChannel(&token, pushMessage)
 				state.AddKnownEventId(&token, &eventId)
 			} else {
-				log.Printf("%d not connected\n", targetPushKeyHash)
+				log.Printf("%d is unknown\n", targetPushKeyHash)
 			}
 		}
 
@@ -109,7 +108,7 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 		}
 
 		token := tokens[0]
-		tokenHash := hash(token)
+		tokenHash := hash(&token)
 		log.Printf("connect since %d for %d\n", since, tokenHash)
 
 		state.NewClient(&token)
@@ -119,17 +118,17 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 		clientChannel, hasChannel := state.GetClientChannel(&token)
 
 		if !hasChannel {
-			log.Printf("no connected channel for %d\n", tokenHash)
+			log.Printf("%d has no connected channel\n", tokenHash)
 			return
 		}
 
 		if lastNotify != nil && since < lastNotify.Timestamp {
-			log.Println("say hi with last notify")
+			log.Printf("say hi to %d with last notify", tokenHash)
 			state.SendNotifyToClientChannel(&token, lastNotify)
 		} else if lastNotify == nil {
-			log.Println("no last notify")
+			log.Printf("%d no last notify\n", tokenHash)
 		} else {
-			log.Println("client has not missed events")
+			log.Printf("%d has not missed events\n", tokenHash)
 		}
 
 		wsCloseChannel := make(chan bool, 1)
@@ -159,32 +158,44 @@ func makeSendNotifications(state *SharedState) func(w http.ResponseWriter, r *ht
 			}
 		}()
 
+
+		errorCount := 0
+
 		for {
 			select {
-			case <-r.Context().Done():
-				log.Println("request connection closed")
-				state.RemoveClientChannel(&token)
-				return
 			case <-wsCloseChannel:
-				log.Println("ws connection closed")
+				log.Printf("%d ws connection closed\n", tokenHash)
 				state.RemoveClientChannel(&token)
 				return
 			case <-wsReadErrorChannel:
-				log.Println("ws read error")
-				state.RemoveClientChannel(&token)
-				return
+				errorCount ++
+				log.Printf("%d ws read error[%d]\n", tokenHash, errorCount)
+				if errorCount > 10 {
+					state.RemoveClientChannel(&token)
+					log.Printf("%d channel removed")
+					return
+				}
 			case <-wsPingChannel:
-				log.Println("received ping")
+				errorCount = 0
+				//log.Printf("%d sent ping\n", tokenHash)
 			case notifyRequest := <-clientChannel:
 
-				log.Println("send data")
+				log.Printf("send message to %d\n", tokenHash)
 				strBytes, _ := json.Marshal(notifyRequest)
 
 				err := ws.WriteMessage(websocket.TextMessage, strBytes)
 
 				if err != nil {
-					log.Println(err.Error())
-					return
+					errorCount ++
+					log.Printf("%d write error[%d]: %s\n", tokenHash, errorCount, err.Error())
+
+					if errorCount > 10 {
+						state.RemoveClientChannel(&token)
+						log.Printf("%d channel removed", tokenHash)
+						return
+					}
+				} else {
+					errorCount = 0
 				}
 			}
 		}
@@ -209,37 +220,40 @@ func makeHandlePollLastNotify(state *SharedState) func(w http.ResponseWriter, r 
 			return
 		}
 
-		since, err := strconv.Atoi(sinces[0])
-		if err != nil {
+		since, parseSinceError := strconv.Atoi(sinces[0])
+		if parseSinceError != nil {
 			http.Error(w, "since must be int", 400)
 			return
 		}
 
-		log.Printf("Poll since %d with token %s\n", since, token)
+		tokenHash := hash(&token)
+		log.Printf("poll requset for %d since %d \n", tokenHash, since)
 
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "application/json")
 		isClientKnown := state.IsClientKnown(&token)
 
 		if !isClientKnown {
+			log.Printf("%d is unknown, return 400\n", tokenHash)
 			http.Error(w, "invalid token", 400)
 			return
 		}
 
 		lastNotify := state.GetLastNotify(&token)
 		if lastNotify == nil {
-			log.Println("No lastNotify")
+			log.Printf("%d never had a message\n", tokenHash)
 			return
 		}
 
-		if lastNotify.Timestamp > since {
-			strBytes, _ := json.Marshal(lastNotify)
-			jsonString := RemoveLineBreaks(string(strBytes))
-			_, err := fmt.Fprintf(w, jsonString+"\n")
-			if err != nil {
-				log.Println(err.Error())
-			}
-			return
+		if lastNotify.Timestamp <= since {
+			log.Printf("%d has no missed message\n", tokenHash)
+		}
+
+		strBytes, _ := json.Marshal(lastNotify)
+		jsonString := RemoveLineBreaks(string(strBytes))
+		_, err := fmt.Fprintf(w, jsonString+"\n")
+		if err != nil {
+			log.Println(err.Error())
 		}
 	}
 }
@@ -354,30 +368,33 @@ func (state *SharedState) AddKnownEventId(token *string, eventId *string) {
 func (state *SharedState) SendNotifyToClientChannel(token *string, notify *PushMessage) {
 	channel := state.clients[*token].channel
 
+	tokenHash := hash(token)
 	if channel == nil {
-		log.Println("no active channel to known client")
+		log.Printf("%d has no active channel\n", tokenHash)
 		return
 	}
 
 	l := len(channel)
 	if l > 0 {
-		log.Printf("%d messages in channel\n", l)
+		log.Printf("%d has queued up %d messages in channel\n", tokenHash, l)
 	}
 
 	select {
 	case channel <- notify:
 	default:
-		log.Println("sending to channel would block, skipping!")
+		log.Printf("%d channel is full, drop message!\n", tokenHash)
 	}
 }
 func (state *SharedState) NewClient(token *string) {
+	tokenHash := hash(token)
+
 	state.mux.Lock()
 	known := state.clients[*token] != nil
 	if known {
-		log.Println("old channel exits! ... will be replaced!")
+		log.Printf("%d channel will be replaced!\n", tokenHash)
 		state.clients[*token].channel = make(chan *PushMessage, 1000)
 	} else {
-		log.Printf("new client #%d\n", len(state.clients))
+		log.Printf("%d is new client(#%d)\n", tokenHash, len(state.clients))
 		state.clients[*token] = &ClientState{
 			channel:      make(chan *PushMessage, 1000),
 			lastNotify:   nil,
